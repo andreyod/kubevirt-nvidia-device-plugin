@@ -187,7 +187,6 @@ func getDeviceName(deviceID string) string {
 
 		deviceName = strings.TrimPrefix(line, prefix)
 		deviceName = strings.TrimSpace(deviceName)
-		deviceName = strings.ToUpper(deviceName)
 		deviceName = strings.Replace(deviceName, "/", "_", -1)
 		deviceName = strings.Replace(deviceName, ".", "_", -1)
 		// Replace all spaces with underscore
