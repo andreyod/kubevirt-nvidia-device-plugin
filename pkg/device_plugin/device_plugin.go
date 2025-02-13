@@ -37,7 +37,7 @@ func InitiateDevicePlugin() {
 func createDevicePlugins(deviceMap map[string][]*PCIDevice) {
 	var devicePlugins []*GenericDevicePlugin
 	var devs []*pluginapi.Device
-	log.Printf("Device Map %v", deviceMap)
+	log.Printf("Device Map: %v", deviceMap)
 
 	//Iterate over deivceMap to create device plugin for each type of GPU on the host
 	for id, devices := range deviceMap {
@@ -56,8 +56,8 @@ func createDevicePlugins(deviceMap map[string][]*PCIDevice) {
 			log.Printf("Error: Could not find device name for device id: %s", id)
 			deviceName = id
 		}
-		log.Printf("DP Name %s", deviceName)
-		log.Printf("Iommu Map %s", iommuToPCIMap)
+		log.Printf("DP Name: %s", deviceName)
+		log.Printf("Iommu Map: %s", iommuToPCIMap)
 		dp := NewGenericDevicePlugin(deviceName, "/dev/vfio/", devs, iommuToPCIMap)
 		err := startDevicePlugin(dp)
 		if err != nil {
@@ -89,10 +89,9 @@ func discoverPCIDevices() map[string][]*PCIDevice {
 			return err
 		}
 		if info.IsDir() {
-			log.Println("Not a device, continuing")
+			// Not a device, continue
 			return nil
 		}
-		//Retrieve vendor for the device
 		vendorID, err := readIDFromFile(basePath, info.Name(), "vendor")
 		if err != nil {
 			log.Println("Could not get vendor ID for device ", info.Name())
@@ -101,8 +100,7 @@ func discoverPCIDevices() map[string][]*PCIDevice {
 
 		//Nvidia vendor id is "10de". Proceed if vendor id is 10de
 		if vendorID == "10de" {
-			log.Println("Nvidia device ", info.Name())
-			//Retrieve iommu group for the device
+			log.Println("Nvidia device: ", info.Name())
 			driver, err := readLink(basePath, info.Name(), "driver")
 			if err != nil {
 				log.Println("Could not get driver for device ", info.Name())
@@ -114,18 +112,19 @@ func discoverPCIDevices() map[string][]*PCIDevice {
 					log.Println("Could not get IOMMU Group for device ", info.Name())
 					return nil
 				}
-				log.Println("Iommu Group " + iommuGroup)
 				deviceID, err := readIDFromFile(basePath, info.Name(), "device")
 				if err != nil {
-					log.Println("Could get deviceID for PCI address ", info.Name())
+					log.Println("Could not get deviceID for PCI address ", info.Name())
 					return nil
 				}
-				log.Printf("Device Id %s", deviceID)
+				log.Printf("ID: %s ; Iommu Group: %s", deviceID, iommuGroup)
 				pcidev := &PCIDevice{
 					pciAddress: info.Name(),
 					iommuGroup: iommuGroup,
 				}
 				pciDevicesMap[deviceID] = append(pciDevicesMap[deviceID], pcidev)
+			} else {
+				log.Println("The device is not using vfio-pci kernel driver. Skipping")
 			}
 		}
 		return nil

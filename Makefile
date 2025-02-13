@@ -1,4 +1,4 @@
-DOCKER_REPO ?= "docker.io/kubevirt/kubevirt-nvidia-device-plugin"
+DOCKER_REPO ?= "localhost:5000/kubevirt-nvidia-device-plugin"
 DOCKER_TAG ?= v1.0
 
 build:

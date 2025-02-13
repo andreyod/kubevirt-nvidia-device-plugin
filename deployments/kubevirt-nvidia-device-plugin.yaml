@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kubevirt-nvidia-device-plugin
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      name: kubevirt-nvidia-dp
+  template:
+    metadata:
+      labels:
+        name: kubevirt-nvidia-dp
+    spec:
+      priorityClassName: system-node-critical
+      tolerations:
+      - key: CriticalAddonsOnly
+        operator: Exists
+      containers:
+      - name: kubevirt-nvidia-dp
+        image: localhost:5000/kubevirt-nvidia-device-plugin:v1.0
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+          seLinuxOptions:
+            level: s0
+        volumeMounts:
+          - name: device-plugin
+            mountPath: /var/lib/kubelet/device-plugins
+          - name: vfio
+            mountPath: /dev/vfio
+      volumes:
+        - name: device-plugin
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+        - name: vfio
+          hostPath:
+            path: /dev/vfio
