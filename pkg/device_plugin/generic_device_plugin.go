@@ -1,6 +1,7 @@
 package device_plugin
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"log"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,10 +20,11 @@ import (
 )
 
 const (
-	DeviceNamespace   = "nvidia.com"
-	connectionTimeout = 5 * time.Second
-	vfioDevicePath    = "/dev/vfio"
-	gpuPrefix         = "PCI_RESOURCE_NVIDIA_COM"
+	DeviceNamespace     = "nvidia.com"
+	connectionTimeout   = 5 * time.Second
+	vfioDevicePath      = "/dev/vfio"
+	gpuPrefix           = "PCI_RESOURCE_NVIDIA_COM"
+	partitionDataSource = "/var/lib/kubelet/device-plugins/partitions"
 )
 
 type DevicePluginBase struct {
@@ -236,15 +239,75 @@ func (dpi *GenericDevicePlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.Dev
 	}
 }
 
+// func (dpi *GenericDevicePlugin) Allocate(_ context.Context, r *pluginapi.AllocateRequest) (*pluginapi.AllocateResponse, error) {
+// 	resourceNameEnvVar := fmt.Sprintf("%s_%s", gpuPrefix, strings.ToUpper(dpi.deviceName))
+// 	allocatedDevices := []string{}
+// 	resp := new(pluginapi.AllocateResponse)
+// 	containerResponse := new(pluginapi.ContainerAllocateResponse)
+
+// 	for _, request := range r.ContainerRequests {
+// 		deviceSpecs := make([]*pluginapi.DeviceSpec, 0)
+// 		for _, devID := range request.DevicesIDs {
+// 			log.Printf("------ devID from the request - %s", devID)
+// 			// translate device's iommu group to its pci address
+// 			devPCIAddress, exist := dpi.iommuToPCIMap[devID]
+// 			if !exist {
+// 				log.Printf("Missing device mapping for %s", devID)
+// 				continue
+// 			}
+// 			allocatedDevices = append(allocatedDevices, devPCIAddress)
+// 			deviceSpecs = append(deviceSpecs, formatDeviceSpecs(devID)...)
+// 		}
+// 		containerResponse.Devices = deviceSpecs
+// 		envVar := make(map[string]string)
+// 		envVar[resourceNameEnvVar] = strings.Join(allocatedDevices, ",")
+
+// 		log.Printf("Allocated devices %s", envVar)
+// 		containerResponse.Envs = envVar
+// 		resp.ContainerResponses = append(resp.ContainerResponses, containerResponse)
+// 	}
+// 	return resp, nil
+// }
+
 func (dpi *GenericDevicePlugin) Allocate(_ context.Context, r *pluginapi.AllocateRequest) (*pluginapi.AllocateResponse, error) {
 	resourceNameEnvVar := fmt.Sprintf("%s_%s", gpuPrefix, strings.ToUpper(dpi.deviceName))
 	allocatedDevices := []string{}
 	resp := new(pluginapi.AllocateResponse)
 	containerResponse := new(pluginapi.ContainerAllocateResponse)
 
+	// 	[root@kubevirt-nvidia-device-plugin-48qg9 device-plugins]# cat partitions
+	// partition1 4 235|0000:87:00.0,52|0000:4d:00.0,242|0000:8d:00.0,89|0000:07:00.0 free
+	// partition2 4 235|0000:87:00.0,52|0000:4d:00.0,242|0000:8d:00.0,89|0000:07:00.0 free
+
+	// partition2 := []string{"93|0000:0a:00.0", "89|0000:07:00.0"}
+	// partition4 := []string{"235|0000:87:00.0", "52|0000:4d:00.0", "242|0000:8d:00.0", "89|0000:07:00.0"}
+
 	for _, request := range r.ContainerRequests {
 		deviceSpecs := make([]*pluginapi.DeviceSpec, 0)
 		for _, devID := range request.DevicesIDs {
+			log.Printf("------ devID from the request - %s", devID)
+		}
+		devicesIDs := request.DevicesIDs
+
+		if !strings.Contains(dpi.deviceName, "NVSwitch") {
+			partitionLines, err := readLines(partitionDataSource)
+			if err != nil || len(partitionLines) == 0 {
+				// Do the regular flow
+				log.Printf("Not using partition. ------ lines: %v", partitionLines)
+			} else {
+				partition := get_devices_from_partition(len(request.DevicesIDs), partitionLines)
+				if len(partition) == len(request.DevicesIDs) {
+					log.Printf("------ using partition - %s", partition)
+					devicesIDs = partition
+				} else {
+					log.Printf("Selected partition doesn't match the request. Ignore partition: %v", partition)
+					// Do the regular flow
+				}
+			}
+		}
+
+		for _, devID := range devicesIDs {
+			log.Printf("------ devID from the request - %s", devID)
 			// translate device's iommu group to its pci address
 			devPCIAddress, exist := dpi.iommuToPCIMap[devID]
 			if !exist {
@@ -254,6 +317,8 @@ func (dpi *GenericDevicePlugin) Allocate(_ context.Context, r *pluginapi.Allocat
 			allocatedDevices = append(allocatedDevices, devPCIAddress)
 			deviceSpecs = append(deviceSpecs, formatDeviceSpecs(devID)...)
 		}
+
+		log.Printf("--- deviceSpecs: %d", len(deviceSpecs))
 		containerResponse.Devices = deviceSpecs
 		envVar := make(map[string]string)
 		envVar[resourceNameEnvVar] = strings.Join(allocatedDevices, ",")
@@ -263,6 +328,95 @@ func (dpi *GenericDevicePlugin) Allocate(_ context.Context, r *pluginapi.Allocat
 		resp.ContainerResponses = append(resp.ContainerResponses, containerResponse)
 	}
 	return resp, nil
+}
+
+func get_devices_from_partition(requestedDevNumber int, partitionLines []string) []string {
+	for i, line := range partitionLines {
+		partition := strings.Split(line, " ")
+		log.Printf("------ looking at partition: %v", partition)
+		if len(partition) != 4 {
+			log.Printf("Warning: Invalid partition: %v", partition)
+			continue
+		}
+		partitionDevs, err := strconv.Atoi(partition[1])
+		if err != nil {
+			continue
+		}
+		if partition[3] == "free" && partitionDevs == requestedDevNumber {
+			log.Printf("----- partition found: %s", partition[2])
+			partitionLines[i] = strings.ReplaceAll(line, "free", "active")
+			// write to file
+			if err = writeLines(partitionDataSource, partitionLines); err != nil {
+				log.Printf("Failed to update partitionDataSource. Error: %v", err)
+			}
+			return strings.Split(partition[2], ",")
+		}
+	}
+	return []string{}
+}
+
+func readLines(filePath string) ([]string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var lines []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	return lines, nil
+}
+
+func writeLines(filePath string, lines []string) error {
+	file, err := os.Create(filePath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	writer := bufio.NewWriter(file)
+	for _, line := range lines {
+		_, err := writer.WriteString(line + "\n")
+		if err != nil {
+			return err
+		}
+	}
+	writer.Flush()
+	return nil
+}
+
+func test() {
+	filePath := "./example.txt" // Change this to your file path
+	lines, err := readLines(filePath)
+	if err != nil {
+		fmt.Println("Error reading file:", err)
+		return
+	}
+
+	fmt.Println("File lines:")
+	for i, line := range lines {
+		fmt.Printf("%d: %s\n", i+1, line)
+		if strings.Contains(line, "kuku") {
+			lines[i] = strings.ReplaceAll(line, "kuku", "mumu")
+		}
+	}
+
+	fmt.Println("Updated File lines:")
+	for i, line := range lines {
+		fmt.Printf("%d: %s\n", i+1, line)
+	}
+
+	if err := writeLines(filePath, lines); err != nil {
+		fmt.Println("Error writing file:", err)
+	}
 }
 
 func (dpi *GenericDevicePlugin) cleanup() error {
