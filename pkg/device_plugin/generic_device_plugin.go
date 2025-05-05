@@ -59,8 +59,9 @@ type GenericDevicePlugin struct {
 
 // Returns an initialized instance of GenericDevicePlugin
 func NewGenericDevicePlugin(deviceName string, devicePath string, devices []*pluginapi.Device, iommuToPCIMap map[string]string) *GenericDevicePlugin {
-	//log.Println("Devicename " + deviceName)
+
 	serverSock := fmt.Sprintf(pluginapi.DevicePluginPath+"kubevirt-%s.sock", deviceName)
+
 	dpi := &GenericDevicePlugin{
 		devs:          devices,
 		socketPath:    serverSock,
@@ -72,14 +73,6 @@ func NewGenericDevicePlugin(deviceName string, devicePath string, devices []*plu
 		iommuToPCIMap: iommuToPCIMap,
 	}
 	return dpi
-}
-
-func buildEnv(envList map[string][]string) map[string]string {
-	env := map[string]string{}
-	for key, devList := range envList {
-		env[key] = strings.Join(devList, ",")
-	}
-	return env
 }
 
 func waitForGrpcServer(socketPath string, timeout time.Duration) error {
@@ -126,8 +119,7 @@ func (dpi *GenericDevicePlugin) Start(stop chan struct{}) error {
 
 	sock, err := net.Listen("unix", dpi.socketPath)
 	if err != nil {
-		log.Printf("[%s] Error creating GRPC server socket: %v", dpi.deviceName, err)
-		return err
+		return fmt.Errorf("[%s] Error creating GRPC server socket: %v", dpi.deviceName, err)
 	}
 
 	dpi.server = grpc.NewServer([]grpc.ServerOption{}...)
@@ -137,14 +129,12 @@ func (dpi *GenericDevicePlugin) Start(stop chan struct{}) error {
 
 	err = waitForGrpcServer(dpi.socketPath, connectionTimeout)
 	if err != nil {
-		// this err is returned at the end of the Start function
-		log.Printf("[%s] Error connecting to GRPC server: %v", dpi.deviceName, err)
+		return fmt.Errorf("[%s] Error connecting to GRPC server: %v", dpi.deviceName, err)
 	}
 
 	err = dpi.Register()
 	if err != nil {
-		log.Printf("[%s] Error registering with device plugin manager: %v", dpi.deviceName, err)
-		return err
+		return fmt.Errorf("[%s] Error registering with device plugin manager: %v", dpi.deviceName, err)
 	}
 
 	go dpi.healthCheck()
@@ -258,7 +248,7 @@ func (dpi *GenericDevicePlugin) Allocate(_ context.Context, r *pluginapi.Allocat
 		envVar := make(map[string]string)
 		envVar[resourceNameEnvVar] = strings.Join(allocatedDevices, ",")
 
-		log.Printf("Allocated devices %s", envVar)
+		log.Printf("Device Plugin %s Allocated devices %s", dpi.deviceName, envVar[resourceNameEnvVar])
 		containerResponse.Envs = envVar
 		resp.ContainerResponses = append(resp.ContainerResponses, containerResponse)
 	}
@@ -296,13 +286,12 @@ func (dpi *GenericDevicePlugin) GetPreferredAllocation(ctx context.Context, in *
 	return nil, nil
 }
 
-// Health check of GPU devices
+// Health check for devices
 func (dpi *GenericDevicePlugin) healthCheck() error {
 	method := fmt.Sprintf("healthCheck(%s)", dpi.deviceName)
 	log.Printf("%s: invoked", method)
 	var pathDeviceMap = make(map[string]string)
 	var path = dpi.devicePath
-	var health = ""
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -314,6 +303,12 @@ func (dpi *GenericDevicePlugin) healthCheck() error {
 	err = watcher.Add(filepath.Dir(dpi.socketPath))
 	if err != nil {
 		log.Printf("%s: Unable to add device plugin socket path to fsnotify watcher: %v", method, err)
+		return err
+	}
+
+	err = watcher.Add(path)
+	if err != nil {
+		log.Printf("%s: Unable to add %s to fsnotify watcher: %v", method, path, err)
 		return err
 	}
 
@@ -340,20 +335,20 @@ func (dpi *GenericDevicePlugin) healthCheck() error {
 		select {
 		case <-dpi.stop:
 			return nil
+		case err := <-watcher.Errors:
+			log.Printf("Error watching devices and device plugin directory: %v", err)
 		case event := <-watcher.Events:
 			v, ok := pathDeviceMap[event.Name]
 			if ok {
 				// Health in this case is if the device path actually exists
 				if event.Op == fsnotify.Create {
-					health = v
-					dpi.healthy <- health
+					log.Printf("%s: Monitored device %s appeared", method, event.Name)
+					dpi.healthy <- v
 				} else if (event.Op == fsnotify.Remove) || (event.Op == fsnotify.Rename) {
-					log.Printf("%s: Marking device unhealthy: %s", method, event.Name)
-					health = v
-					dpi.unhealthy <- health
+					log.Printf("%s: Monitored device %s disappeared", method, event.Name)
+					dpi.unhealthy <- v
 				}
 			} else if event.Name == dpi.socketPath && event.Op == fsnotify.Remove {
-				// Watcher event for removal of socket file
 				log.Printf("%s: Socket path for GPU device was removed, kubelet likely restarted", method)
 				// Trigger restart of the DP servers
 				if err := dpi.restart(); err != nil {
