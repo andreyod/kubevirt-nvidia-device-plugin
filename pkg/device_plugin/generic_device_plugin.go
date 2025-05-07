@@ -24,7 +24,8 @@ const (
 	gpuPrefix         = "PCI_RESOURCE_NVIDIA_COM"
 )
 
-type DevicePluginBase struct {
+// Implements the kubernetes device plugin API
+type GenericDevicePlugin struct {
 	devs       []*pluginapi.Device
 	server     *grpc.Server
 	socketPath string
@@ -35,42 +36,23 @@ type DevicePluginBase struct {
 	devicePath string
 	deviceName string
 	devsHealth []*pluginapi.Device
-}
-
-type PCIDevicePlugin struct {
-	*DevicePluginBase
-	iommuToPCIMap map[string]string
-}
-
-// Implements the kubernetes device plugin API
-type GenericDevicePlugin struct {
-	devs          []*pluginapi.Device
-	server        *grpc.Server
-	socketPath    string
-	stop          chan struct{} // this channel signals to stop the DP
-	term          chan bool     // this channel detects kubelet restarts
-	healthy       chan string
-	unhealthy     chan string
-	devicePath    string
-	deviceName    string
-	devsHealth    []*pluginapi.Device
-	iommuToPCIMap map[string]string
+	idToPCIMap map[string]string
 }
 
 // Returns an initialized instance of GenericDevicePlugin
-func NewGenericDevicePlugin(deviceName string, devicePath string, devices []*pluginapi.Device, iommuToPCIMap map[string]string) *GenericDevicePlugin {
+func NewGenericDevicePlugin(deviceName string, devicePath string, devices []*pluginapi.Device, idToPCIMap map[string]string) *GenericDevicePlugin {
 
 	serverSock := fmt.Sprintf(pluginapi.DevicePluginPath+"kubevirt-%s.sock", deviceName)
 
 	dpi := &GenericDevicePlugin{
-		devs:          devices,
-		socketPath:    serverSock,
-		term:          make(chan bool, 1),
-		healthy:       make(chan string),
-		unhealthy:     make(chan string),
-		deviceName:    deviceName,
-		devicePath:    devicePath,
-		iommuToPCIMap: iommuToPCIMap,
+		devs:       devices,
+		socketPath: serverSock,
+		term:       make(chan bool, 1),
+		healthy:    make(chan string),
+		unhealthy:  make(chan string),
+		deviceName: deviceName,
+		devicePath: devicePath,
+		idToPCIMap: idToPCIMap,
 	}
 	return dpi
 }
@@ -203,18 +185,18 @@ func (dpi *GenericDevicePlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.Dev
 	for {
 		select {
 		case unhealthy := <-dpi.unhealthy:
-			log.Printf("In watch unhealthy")
 			for _, dev := range dpi.devs {
 				if unhealthy == dev.ID {
 					dev.Health = pluginapi.Unhealthy
+					log.Printf("Device %s has become %s", dev.ID, pluginapi.Unhealthy)
 				}
 			}
 			s.Send(&pluginapi.ListAndWatchResponse{Devices: dpi.devs})
 		case healthy := <-dpi.healthy:
-			log.Printf("In watch healthy")
 			for _, dev := range dpi.devs {
 				if healthy == dev.ID {
 					dev.Health = pluginapi.Healthy
+					log.Printf("Device %s has become %s", dev.ID, pluginapi.Healthy)
 				}
 			}
 			s.Send(&pluginapi.ListAndWatchResponse{Devices: dpi.devs})
@@ -235,8 +217,8 @@ func (dpi *GenericDevicePlugin) Allocate(_ context.Context, r *pluginapi.Allocat
 	for _, request := range r.ContainerRequests {
 		deviceSpecs := make([]*pluginapi.DeviceSpec, 0)
 		for _, devID := range request.DevicesIDs {
-			// translate device's iommu group to its pci address
-			devPCIAddress, exist := dpi.iommuToPCIMap[devID]
+			// translate device's id to its pci address
+			devPCIAddress, exist := dpi.idToPCIMap[devID]
 			if !exist {
 				log.Printf("Missing device mapping for %s", devID)
 				continue
@@ -323,12 +305,8 @@ func (dpi *GenericDevicePlugin) healthCheck() error {
 	for _, dev := range dpi.devs {
 		iommuGroup := strings.Split(dev.ID, deviceIDSeparator)[0]
 		devicePath := filepath.Join(path, iommuGroup)
-		err = watcher.Add(devicePath)
+		watcher.Add(devicePath)
 		pathDeviceMap[devicePath] = dev.ID
-		if err != nil {
-			log.Printf("%s: Unable to add device path to fsnotify watcher: %v", method, err)
-			return err
-		}
 	}
 
 	for {
