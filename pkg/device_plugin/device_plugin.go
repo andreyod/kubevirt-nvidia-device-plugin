@@ -23,6 +23,7 @@ const (
 type PCIDevice struct {
 	pciAddress string
 	iommuGroup string
+	health     string
 }
 
 var stop = make(chan struct{})
@@ -41,13 +42,13 @@ func createDevicePlugins(deviceMap map[string][]*PCIDevice) {
 	//Iterate over deivceMap to create device plugin for each type of GPU on the host
 	for id, devices := range deviceMap {
 		devs = nil
-		iommuToPCIMap := make(map[string]string)
+		idToPCIMap := make(map[string]string)
 		for _, device := range devices {
 			deviceID := strings.Join([]string{device.iommuGroup, device.pciAddress}, deviceIDSeparator)
-			iommuToPCIMap[deviceID] = device.pciAddress
+			idToPCIMap[deviceID] = device.pciAddress
 			devs = append(devs, &pluginapi.Device{
 				ID:     deviceID,
-				Health: pluginapi.Healthy,
+				Health: device.health,
 			})
 		}
 		deviceName := getDeviceName(id)
@@ -55,7 +56,7 @@ func createDevicePlugins(deviceMap map[string][]*PCIDevice) {
 			log.Printf("Error: Could not find device name for device id: %s", id)
 			deviceName = id
 		}
-		dp := NewGenericDevicePlugin(deviceName, "/dev/vfio/", devs, iommuToPCIMap)
+		dp := NewGenericDevicePlugin(deviceName, vfioDevicePath, devs, idToPCIMap)
 		log.Printf("Starting Device Plugin: %s", deviceName)
 		err := startDevicePlugin(dp)
 		if err != nil {
@@ -102,29 +103,28 @@ func discoverPCIDevices() map[string][]*PCIDevice {
 			driver, err := readLink(basePath, info.Name(), "driver")
 			if err != nil {
 				log.Println("Could not get driver for device: ", info.Name())
+			}
+			iommuGroup, err := readLink(basePath, info.Name(), "iommu_group")
+			if err != nil {
+				log.Println("Could not get IOMMU Group for device: ", info.Name())
 				return nil
 			}
-			if driver == "vfio-pci" {
-				iommuGroup, err := readLink(basePath, info.Name(), "iommu_group")
-				if err != nil {
-					log.Println("Could not get IOMMU Group for device: ", info.Name())
-					return nil
-				}
-				deviceID, err := readIDFromFile(basePath, info.Name(), "device")
-				if err != nil {
-					log.Println("Could not get device ID for device: ", info.Name())
-					return nil
-				}
-				pcidev := &PCIDevice{
-					pciAddress: info.Name(),
-					iommuGroup: iommuGroup,
-				}
-				pciDevicesMap[deviceID] = append(pciDevicesMap[deviceID], pcidev)
-				log.Printf("Device ID: %s ; IOMMU Group: %s", deviceID, iommuGroup)
-			} else {
-				log.Println("The device is not using vfio-pci kernel driver. Skipping")
-				// TODO: add the device as unhealthy for later driver change monitoring
+			deviceID, err := readIDFromFile(basePath, info.Name(), "device")
+			if err != nil {
+				log.Println("Could not get device ID for device: ", info.Name())
+				return nil
 			}
+			pcidev := &PCIDevice{
+				pciAddress: info.Name(),
+				iommuGroup: iommuGroup,
+				health:     pluginapi.Healthy,
+			}
+			if driver != "vfio-pci" {
+				log.Println("The device is not using vfio-pci kernel driver. Unhealthy for passthrough")
+				pcidev.health = pluginapi.Unhealthy
+			}
+			pciDevicesMap[deviceID] = append(pciDevicesMap[deviceID], pcidev)
+			log.Printf("Device ID: %s ; IOMMU Group: %s ; Driver: %s ; Health: %s", deviceID, iommuGroup, driver, pcidev.health)
 		}
 		return nil
 	})
