@@ -18,10 +18,10 @@ import (
 )
 
 const (
-	DeviceNamespace   = "nvidia.com"
-	connectionTimeout = 5 * time.Second
-	vfioDevicePath    = "/dev/vfio"
-	gpuPrefix         = "PCI_RESOURCE_NVIDIA_COM"
+	DeviceNamespace    = "nvidia.com"
+	connectionTimeout  = 5 * time.Second
+	vfioDevicePath     = "/dev/vfio"
+	resourceNamePrefix = "PCI_RESOURCE_NVIDIA_COM"
 )
 
 // Implements the kubernetes device plugin API
@@ -39,7 +39,7 @@ type GenericDevicePlugin struct {
 	idToPCIMap map[string]string
 }
 
-// Returns an initialized instance of GenericDevicePlugin
+// NewGenericDevicePlugin returns an initialized instance of GenericDevicePlugin
 func NewGenericDevicePlugin(deviceName string, devicePath string, devices []*pluginapi.Device, idToPCIMap map[string]string) *GenericDevicePlugin {
 
 	serverSock := fmt.Sprintf(pluginapi.DevicePluginPath+"kubevirt-%s.sock", deviceName)
@@ -66,7 +66,6 @@ func waitForGrpcServer(socketPath string, timeout time.Duration) error {
 	return nil
 }
 
-// dial establishes the gRPC communication with the registered device plugin.
 func connect(socketPath string, timeout time.Duration) (*grpc.ClientConn, error) {
 	ctx, _ := context.WithTimeout(context.Background(), timeout)
 	c, err := grpc.DialContext(ctx, socketPath,
@@ -141,7 +140,6 @@ func (dpi *GenericDevicePlugin) Stop() error {
 	return dpi.cleanup()
 }
 
-// Restarts DP server
 func (dpi *GenericDevicePlugin) restart() error {
 	log.Printf("Restarting %s device plugin server", dpi.deviceName)
 	if dpi.server == nil {
@@ -177,7 +175,8 @@ func (dpi *GenericDevicePlugin) Register() error {
 	return nil
 }
 
-// ListAndWatch lists devices and update that list according to the health status
+// ListAndWatch returns a stream of List of Devices
+// Whenever a Device state change or a Device disappears, ListAndWatch returns the new list
 func (dpi *GenericDevicePlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.DevicePlugin_ListAndWatchServer) error {
 
 	s.Send(&pluginapi.ListAndWatchResponse{Devices: dpi.devs})
@@ -208,8 +207,10 @@ func (dpi *GenericDevicePlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.Dev
 	}
 }
 
+// Allocate is called by Kubelet during container creation
+// It adds vfio device path to container and creates environment variables used by KubeVirt
 func (dpi *GenericDevicePlugin) Allocate(_ context.Context, r *pluginapi.AllocateRequest) (*pluginapi.AllocateResponse, error) {
-	resourceNameEnvVar := fmt.Sprintf("%s_%s", gpuPrefix, strings.ToUpper(dpi.deviceName))
+	resourceNameEnvVar := fmt.Sprintf("%s_%s", resourceNamePrefix, strings.ToUpper(dpi.deviceName))
 	allocatedDevices := []string{}
 	resp := new(pluginapi.AllocateResponse)
 	containerResponse := new(pluginapi.ContainerAllocateResponse)
@@ -245,6 +246,7 @@ func (dpi *GenericDevicePlugin) cleanup() error {
 	return nil
 }
 
+// GetDevicePluginOptions
 func (dpi *GenericDevicePlugin) GetDevicePluginOptions(ctx context.Context, e *pluginapi.Empty) (*pluginapi.DevicePluginOptions, error) {
 	options := &pluginapi.DevicePluginOptions{
 		PreStartRequired: false,
@@ -252,19 +254,14 @@ func (dpi *GenericDevicePlugin) GetDevicePluginOptions(ctx context.Context, e *p
 	return options, nil
 }
 
+// PreStartContainer
 func (dpi *GenericDevicePlugin) PreStartContainer(ctx context.Context, in *pluginapi.PreStartContainerRequest) (*pluginapi.PreStartContainerResponse, error) {
 	res := &pluginapi.PreStartContainerResponse{}
 	return res, nil
 }
 
-// GetPreferredAllocation is for compatible with new DevicePluginServer API for DevicePlugin service. It has not been implemented in kubevrit-gpu-device-plugin
+// GetPreferredAllocation
 func (dpi *GenericDevicePlugin) GetPreferredAllocation(ctx context.Context, in *pluginapi.PreferredAllocationRequest) (*pluginapi.PreferredAllocationResponse, error) {
-	// TODO
-	// returns a preferred set of devices to allocate
-	// from a list of available ones. The resulting preferred allocation is not
-	// guaranteed to be the allocation ultimately performed by the
-	// devicemanager. It is only designed to help the devicemanager make a more
-	// informed allocation decision when possible.
 	return nil, nil
 }
 

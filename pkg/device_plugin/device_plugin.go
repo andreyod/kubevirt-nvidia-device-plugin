@@ -29,7 +29,7 @@ type PCIDevice struct {
 var stop = make(chan struct{})
 
 func InitiateDevicePlugin() {
-	//Identify Nvidia devices and represent it in appropriate structures
+	//Discover host Nvidia PCI devices
 	deviceMap := discoverPCIDevices()
 	//Create and start device plugin for each Nvidia device type
 	createDevicePlugins(deviceMap)
@@ -39,7 +39,7 @@ func createDevicePlugins(deviceMap map[string][]*PCIDevice) {
 	var devicePlugins []*GenericDevicePlugin
 	var devs []*pluginapi.Device
 
-	//Iterate over deivceMap to create device plugin for each type of GPU on the host
+	//Iterate over deivceMap to create device plugin for each type
 	for id, devices := range deviceMap {
 		devs = nil
 		idToPCIMap := make(map[string]string)
@@ -81,14 +81,14 @@ func discoverPCIDevices() map[string][]*PCIDevice {
 
 	pciDevicesMap := make(map[string][]*PCIDevice)
 
-	//Walk directory to discover pci devices
+	//Walk directory to discover PCI devices
 	filepath.Walk(basePath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			log.Printf("Error accessing file path %q: %v\n", path, err)
 			return err
 		}
 		if info.IsDir() {
-			// Not a device, continue
+			// Not a device
 			return nil
 		}
 		vendorID, err := readIDFromFile(basePath, info.Name(), "vendor")
@@ -99,7 +99,7 @@ func discoverPCIDevices() map[string][]*PCIDevice {
 
 		//Nvidia vendor id is "10de". Proceed if vendor id is 10de
 		if vendorID == nvidiaVendorID {
-			log.Println("Nvidia device discovered. Device: ", info.Name())
+			log.Println("Nvidia device discovered: ", info.Name())
 			driver, err := readLink(basePath, info.Name(), "driver")
 			if err != nil {
 				log.Println("Could not get driver for device: ", info.Name())
