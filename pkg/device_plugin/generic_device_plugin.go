@@ -2,14 +2,15 @@ package device_plugin
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -24,7 +25,7 @@ const (
 	connectionTimeout   = 5 * time.Second
 	vfioDevicePath      = "/dev/vfio"
 	gpuPrefix           = "PCI_RESOURCE_NVIDIA_COM"
-	partitionDataSource = "/var/lib/kubelet/device-plugins/partitions"
+	partitionDataSource = "/var/lib/kubelet/device-plugins/partition-service"
 )
 
 type DevicePluginBase struct {
@@ -274,40 +275,65 @@ func (dpi *GenericDevicePlugin) Allocate(_ context.Context, r *pluginapi.Allocat
 	allocatedDevices := []string{}
 	resp := new(pluginapi.AllocateResponse)
 	containerResponse := new(pluginapi.ContainerAllocateResponse)
-
-	// 	[root@kubevirt-nvidia-device-plugin-48qg9 device-plugins]# cat partitions
-	// partition1 4 235|0000:87:00.0,52|0000:4d:00.0,242|0000:8d:00.0,89|0000:07:00.0 free
-	// partition2 4 235|0000:87:00.0,52|0000:4d:00.0,242|0000:8d:00.0,89|0000:07:00.0 free
-
-	// partition2 := []string{"93|0000:0a:00.0", "89|0000:07:00.0"}
-	// partition4 := []string{"235|0000:87:00.0", "52|0000:4d:00.0", "242|0000:8d:00.0", "89|0000:07:00.0"}
-
+	partitionID := ""
 	for _, request := range r.ContainerRequests {
 		deviceSpecs := make([]*pluginapi.DeviceSpec, 0)
-		for _, devID := range request.DevicesIDs {
+		for _, devID := range request.DevicesIDs { // temp debug
 			log.Printf("------ devID from the request - %s", devID)
 		}
 		devicesIDs := request.DevicesIDs
 
 		if !strings.Contains(dpi.deviceName, "NVSwitch") {
-			partitionLines, err := readLines(partitionDataSource)
-			if err != nil || len(partitionLines) == 0 {
-				// Do the regular flow
-				log.Printf("Not using partition. ------ lines: %v", partitionLines)
-			} else {
-				partition := get_devices_from_partition(len(request.DevicesIDs), partitionLines)
-				if len(partition) == len(request.DevicesIDs) {
-					log.Printf("------ using partition - %s", partition)
-					devicesIDs = partition
-				} else {
-					log.Printf("Selected partition doesn't match the request. Ignore partition: %v", partition)
-					// Do the regular flow
+			log.Println("Activating GPU Partition")
+			ip, err := getPartitionManagerIP(partitionDataSource)
+			if err != nil || ip == "" {
+				log.Printf("Partition Manager IP was not found: %v", err)
+			} else { // try to activate partition
+				activateLines, err := activatePartition(len(request.DevicesIDs), ip)
+				if err != nil {
+					log.Printf("Activate GPU partition error: %v", err)
+					return nil, err
 				}
+				if len(activateLines) < 3 {
+					log.Printf("Failed to activate partition: %v", activateLines)
+					return nil, fmt.Errorf("Failed to activate GPU partition")
+				}
+				// parse the Activate Partition output to get PCI and partition ID.
+				partitionPrefix := "PartitionID"
+				pciPrefix := "00"
+				partitionDevices := []string{}
+				for _, line := range activateLines {
+					if strings.HasPrefix(line, pciPrefix) {
+						devicePCI := strings.SplitN(strings.Split(line, " ")[0], ":", 2)[1]
+						log.Printf("PCI from Activated Partition: %s", devicePCI)
+						partitionDevices = append(partitionDevices, strings.ToLower(devicePCI))
+					}
+					if strings.HasPrefix(line, partitionPrefix) {
+						partitionID = strings.Split(line, " ")[1]
+						log.Printf("Activated Partition ID: %s", partitionID)
+					}
+				}
+				if len(partitionDevices) != len(devicesIDs) {
+					log.Printf("Mismatch: partition has %s devices but want %s", len(partitionDevices), len(devicesIDs))
+					return nil, fmt.Errorf("Mismatch: partition has %s devices but want %s", len(partitionDevices), len(devicesIDs))
+				}
+				// find DevicesIDs for partitionDevices
+				partitionDeviceIDs := []string{}
+				for _, dev := range partitionDevices {
+					for k, v := range dpi.iommuToPCIMap {
+						if strings.Contains(v, dev) {
+							partitionDeviceIDs = append(partitionDeviceIDs, k)
+						}
+					}
+				}
+				if len(partitionDeviceIDs) != len(devicesIDs) || partitionID == "" {
+					log.Printf("Failed to activate %d GPU partition: %v", len(devicesIDs), activateLines)
+					return nil, fmt.Errorf("Failed to activate GPU partition")
+				}
+				devicesIDs = partitionDeviceIDs
 			}
 		}
-
 		for _, devID := range devicesIDs {
-			log.Printf("------ devID from the request - %s", devID)
 			// translate device's iommu group to its pci address
 			devPCIAddress, exist := dpi.iommuToPCIMap[devID]
 			if !exist {
@@ -318,10 +344,15 @@ func (dpi *GenericDevicePlugin) Allocate(_ context.Context, r *pluginapi.Allocat
 			deviceSpecs = append(deviceSpecs, formatDeviceSpecs(devID)...)
 		}
 
-		log.Printf("--- deviceSpecs: %d", len(deviceSpecs))
 		containerResponse.Devices = deviceSpecs
 		envVar := make(map[string]string)
 		envVar[resourceNameEnvVar] = strings.Join(allocatedDevices, ",")
+		if partitionID != "" {
+			annotations := make(map[string]string)
+			annotations["partitionID"] = partitionID
+			containerResponse.Annotations = annotations
+			log.Println("Annotated partitionID")
+		}
 
 		log.Printf("Allocated devices %s", envVar)
 		containerResponse.Envs = envVar
@@ -330,29 +361,49 @@ func (dpi *GenericDevicePlugin) Allocate(_ context.Context, r *pluginapi.Allocat
 	return resp, nil
 }
 
-func get_devices_from_partition(requestedDevNumber int, partitionLines []string) []string {
-	for i, line := range partitionLines {
-		partition := strings.Split(line, " ")
-		log.Printf("------ looking at partition: %v", partition)
-		if len(partition) != 4 {
-			log.Printf("Warning: Invalid partition: %v", partition)
-			continue
+func activatePartition(numberOfGPUs int, partitionManagerIP string) ([]string, error) {
+
+	activateCommand := `echo "A ` + fmt.Sprint(numberOfGPUs) + `" | nc ` + partitionManagerIP + ` 8080`
+	// Create the command: echo "A 4" | nc 10.131.2.107 8080
+	// cmd := exec.Command("sh", "-c", `echo "A 4" | nc 10.131.2.107 8080`)
+	cmd := exec.Command("sh", "-c", activateCommand)
+
+	log.Printf("Run activate partition command: %s", activateCommand)
+
+	// Capture stdout
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	// Run the command
+	err := cmd.Run()
+	if err != nil {
+		return nil, err
+	}
+	// Read the output line by line
+	scanner := bufio.NewScanner(&out)
+	var lines []string
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	return lines, scanner.Err()
+}
+
+func getPartitionManagerIP(file string) (string, error) {
+	var nodename string
+	ips, err := readLines(file)
+	if err != nil {
+		return "", err
+	} else {
+		nodename = os.Getenv("NODE_NAME")
+		if nodename == "" {
+			return "", fmt.Errorf("NODE_NAME env var is not set")
 		}
-		partitionDevs, err := strconv.Atoi(partition[1])
-		if err != nil {
-			continue
-		}
-		if partition[3] == "free" && partitionDevs == requestedDevNumber {
-			log.Printf("----- partition found: %s", partition[2])
-			partitionLines[i] = strings.ReplaceAll(line, "free", "active")
-			// write to file
-			if err = writeLines(partitionDataSource, partitionLines); err != nil {
-				log.Printf("Failed to update partitionDataSource. Error: %v", err)
+		for _, ip := range ips {
+			if strings.HasPrefix(ip, nodename) {
+				return strings.Split(ip, " ")[1], nil
 			}
-			return strings.Split(partition[2], ",")
 		}
 	}
-	return []string{}
+	return "", fmt.Errorf("PartitionManager IP for node %s was not found in %s", nodename, file)
 }
 
 func readLines(filePath string) ([]string, error) {
@@ -373,50 +424,6 @@ func readLines(filePath string) ([]string, error) {
 	}
 
 	return lines, nil
-}
-
-func writeLines(filePath string, lines []string) error {
-	file, err := os.Create(filePath)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	writer := bufio.NewWriter(file)
-	for _, line := range lines {
-		_, err := writer.WriteString(line + "\n")
-		if err != nil {
-			return err
-		}
-	}
-	writer.Flush()
-	return nil
-}
-
-func test() {
-	filePath := "./example.txt" // Change this to your file path
-	lines, err := readLines(filePath)
-	if err != nil {
-		fmt.Println("Error reading file:", err)
-		return
-	}
-
-	fmt.Println("File lines:")
-	for i, line := range lines {
-		fmt.Printf("%d: %s\n", i+1, line)
-		if strings.Contains(line, "kuku") {
-			lines[i] = strings.ReplaceAll(line, "kuku", "mumu")
-		}
-	}
-
-	fmt.Println("Updated File lines:")
-	for i, line := range lines {
-		fmt.Printf("%d: %s\n", i+1, line)
-	}
-
-	if err := writeLines(filePath, lines); err != nil {
-		fmt.Println("Error writing file:", err)
-	}
 }
 
 func (dpi *GenericDevicePlugin) cleanup() error {

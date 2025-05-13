@@ -18,6 +18,12 @@ spec:
         operator: Exists
       containers:
       - name: kubevirt-nvidia-dp
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: spec.nodeName
         image: localhost:5000/kubevirt-nvidia-device-plugin:v1.0
         imagePullPolicy: IfNotPresent
         securityContext:

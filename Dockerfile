@@ -35,5 +35,6 @@ COPY --from=builder /go/src/kubevirt-nvidia-device-plugin/kubevirt-nvidia-device
 COPY --from=builder /go/src/kubevirt-nvidia-device-plugin/utils/pci.ids /usr/pci.ids
 
 RUN yum update -y
+RUN dnf install nc -y
 
 CMD ["kubevirt-nvidia-device-plugin"]
